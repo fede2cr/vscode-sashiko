@@ -51,6 +51,16 @@ jobs:
 
       - run: npm ci
 
+      - name: Set package version from tag or commit
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version="0.0.0-${GITHUB_SHA:0:7}"
+          fi
+          npm version "$version" --no-git-tag-version --allow-same-version
+
       - name: Build bridge
         run: cargo build --release --locked --manifest-path rust/Cargo.toml --target ${{ matrix.rust_target }}
 

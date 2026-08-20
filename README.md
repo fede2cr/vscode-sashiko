@@ -64,8 +64,10 @@ automatically.
 
 To cut a release:
 
-1. Bump `version` in `package.json` and commit.
-2. `git tag v0.1.1 && git push --tags`.
+1. `git tag v0.1.1 && git push --tags`.
+
+The version isn't tracked in `package.json` — CI derives it from the pushed tag
+(`v0.1.1` → `0.1.1`), or from the commit SHA (`0.0.0-<short-sha>`) for non-tag builds.
 
 One-time setup in the repository:
 
