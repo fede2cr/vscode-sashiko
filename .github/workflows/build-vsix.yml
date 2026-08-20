@@ -21,7 +21,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
             vsce_target: linux-arm64
-          - runner: macos-13
+          - runner: macos-latest
             rust_target: x86_64-apple-darwin
             vsce_target: darwin-x64
           - runner: macos-latest
