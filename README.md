@@ -71,7 +71,7 @@ One-time setup in the repository:
 
 - Create a `marketplace` environment (Settings → Environments) and add a `VSCE_PAT`
   secret holding an Azure DevOps personal access token with **Marketplace → Manage**
-  scope for the `sashiko-dev` publisher. Adding required reviewers to that environment
+  scope for the `fede2cr` publisher. Adding required reviewers to that environment
   gates every publish behind a manual approval.
 
 ## Usage
