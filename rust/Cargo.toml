@@ -1,0 +1,36 @@
+[package]
+name = "sashiko-vscode-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Bridges Sashiko's OpenAI-compatible LLM provider onto the VS Code Language Model API"
+publish = false
+
+[[bin]]
+name = "sashiko-vscode-bridge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+futures-core = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "io-std",
+    "io-util",
+    "sync",
+    "net",
+    "time",
+] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

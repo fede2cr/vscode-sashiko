@@ -1,0 +1,70 @@
+name: Build VSIX
+
+# Reusable: the bridge is a native binary, so every VSIX is platform specific.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: ${{ matrix.vsce_target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            vsce_target: linux-x64
+          - runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            vsce_target: linux-arm64
+          - runner: macos-13
+            rust_target: x86_64-apple-darwin
+            vsce_target: darwin-x64
+          - runner: macos-latest
+            rust_target: aarch64-apple-darwin
+            vsce_target: darwin-arm64
+          - runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            vsce_target: win32-x64
+          - runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            vsce_target: win32-arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup target add ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ${{ matrix.rust_target }}
+
+      - run: npm ci
+
+      - name: Build bridge
+        run: cargo build --release --locked --manifest-path rust/Cargo.toml --target ${{ matrix.rust_target }}
+
+      - name: Stage bridge binary
+        run: node scripts/stage-bridge.mjs --target ${{ matrix.rust_target }}
+
+      - name: Bundle extension
+        run: npm run compile -- --production
+
+      - name: Package VSIX
+        run: npx vsce package --target ${{ matrix.vsce_target }} --out vscode-sashiko-${{ matrix.vsce_target }}.vsix
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vsix-${{ matrix.vsce_target }}
+          path: '*.vsix'
+          if-no-files-found: error

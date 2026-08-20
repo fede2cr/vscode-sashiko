@@ -1,0 +1,6 @@
+out/
+dist/
+bin/
+node_modules/
+*.vsix
+rust/target/

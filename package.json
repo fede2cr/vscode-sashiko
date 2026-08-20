@@ -1,0 +1,191 @@
+{
+  "name": "vscode-sashiko",
+  "displayName": "Sashiko Kernel Review",
+  "description": "Run Sashiko Linux kernel patch reviews using the language model already configured in VS Code — no LLM_API_KEY required.",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "publisher": "sashiko-dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sashiko-dev/vscode-sashiko.git"
+  },
+  "engines": {
+    "vscode": "^1.101.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Linters",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "linux",
+    "kernel",
+    "code review",
+    "sashiko",
+    "patch",
+    "mcp"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "sashiko.bridge",
+        "label": "Sashiko Kernel Review"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "sashiko.review",
+        "name": "sashiko",
+        "fullName": "Sashiko",
+        "description": "Review Linux kernel patches",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "patch",
+            "description": "Review the attached or open .patch/.mbox files"
+          },
+          {
+            "name": "changes",
+            "description": "Review the uncommitted changes in the working tree"
+          },
+          {
+            "name": "commits",
+            "description": "Review a git revision or range, for example HEAD~3..HEAD"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "sashiko.reviewHead",
+        "title": "Sashiko: Review HEAD Commit",
+        "icon": "$(search-fuzzy)"
+      },
+      {
+        "command": "sashiko.reviewRange",
+        "title": "Sashiko: Review Commit Range..."
+      },
+      {
+        "command": "sashiko.reviewWorkingTree",
+        "title": "Sashiko: Review Uncommitted Changes"
+      },
+      {
+        "command": "sashiko.reviewOpenPatch",
+        "title": "Sashiko: Review Patch File in Active Editor"
+      },
+      {
+        "command": "sashiko.cancelReview",
+        "title": "Sashiko: Cancel Running Review"
+      },
+      {
+        "command": "sashiko.selectModel",
+        "title": "Sashiko: Select Language Model"
+      },
+      {
+        "command": "sashiko.writeSettings",
+        "title": "Sashiko: Write Settings.toml for Current Session"
+      },
+      {
+        "command": "sashiko.restartBridge",
+        "title": "Sashiko: Restart Language Model Bridge"
+      },
+      {
+        "command": "sashiko.showLog",
+        "title": "Sashiko: Show Log"
+      }
+    ],
+    "configuration": {
+      "title": "Sashiko",
+      "properties": {
+        "sashiko.executable": {
+          "type": "string",
+          "default": "sashiko",
+          "markdownDescription": "Sashiko executable used to run reviews. Use `sashiko` for `sashiko review`, or `sashiko-cli` together with `#sashiko.reviewArgs#` set to the `local --force-local` form."
+        },
+        "sashiko.reviewArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "review",
+            "${range}",
+            "--settings",
+            "${settings}"
+          ],
+          "markdownDescription": "Arguments passed to the Sashiko executable. Supports the `${range}`, `${settings}` and `${repository}` placeholders."
+        },
+        "sashiko.repositoryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Linux kernel git repository under review. Defaults to the first workspace folder."
+        },
+        "sashiko.model": {
+          "type": "string",
+          "default": "",
+          "description": "Pins reviews to one VS Code chat model. Leave empty to follow the model selected in the chat view. Change it with the 'Sashiko: Select Language Model' command."
+        },
+        "sashiko.provider": {
+          "type": "string",
+          "default": "openai-compatible",
+          "enum": [
+            "openai-compatible",
+            "openai-compat"
+          ],
+          "description": "Provider name written to Settings.toml. Older Sashiko releases spell it 'openai-compat'."
+        },
+        "sashiko.worktreeDir": {
+          "type": "string",
+          "default": "review_trees",
+          "description": "Directory Sashiko uses for review worktrees, relative to the repository."
+        },
+        "sashiko.concurrency": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "description": "Number of concurrent reviews. Keep this low: every request consumes your VS Code chat model quota."
+        },
+        "sashiko.maxInputTokens": {
+          "type": "integer",
+          "default": 100000,
+          "description": "Maximum input tokens per request. Capped to the selected model's limit when that is smaller, and Sashiko warns about models that cannot hold this much context."
+        },
+        "sashiko.maxOutputTokens": {
+          "type": "integer",
+          "default": 16384,
+          "description": "Maximum output tokens per response."
+        },
+        "sashiko.bridgePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the sashiko-vscode-bridge binary. Empty uses the binary shipped with the extension."
+        },
+        "sashiko.publishDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Publish review findings as diagnostics in the Problems panel."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build:rust": "cargo build --release --manifest-path rust/Cargo.toml && node scripts/stage-bridge.mjs",
+    "compile": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test:rust": "cargo test --manifest-path rust/Cargo.toml",
+    "package": "npm run build:rust && npm run compile -- --production && vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.101.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
+  }
+}
