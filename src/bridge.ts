@@ -45,6 +45,11 @@ export type ToolHandler = (name: string, args: Record<string, unknown>) => Promi
 const JSON_ONLY_INSTRUCTION =
 	'Reply with a single valid JSON document and nothing else: no prose, no explanation, no markdown code fences.';
 
+/** How many times a turn that streamed nothing is replayed before it is reported. */
+const EMPTY_RESPONSE_ATTEMPTS = 3;
+/** Multiplied by the attempt number, so the provider gets a widening pause. */
+const EMPTY_RESPONSE_BACKOFF_MS = 2000;
+
 /**
  * Owns the `sashiko-vscode-bridge serve` child process and answers its completion
  * requests with `vscode.lm`. This is the only place the extension touches the
@@ -216,45 +221,60 @@ export class LanguageModelBridge implements vscode.Disposable {
 				return;
 			}
 
-			const response = await model.sendRequest(messages, options, cancellation.token);
+			// A model that streams nothing is usually a transient provider hiccup. Sashiko
+			// retries with no backoff at all, so absorb it here rather than let a whole
+			// review collapse into a burst of failed turns.
+			for (let attempt = 1; ; attempt++) {
+				const started = Date.now();
+				const response = await model.sendRequest(messages, options, cancellation.token);
 
-			let toolCalls = 0;
-			let textLength = 0;
-			const ignored = new Set<string>();
-			for await (const part of response.stream) {
-				if (part instanceof vscode.LanguageModelTextPart) {
-					textLength += part.value.length;
-					this.send({ type: 'chunk', id, delta: part.value });
-				} else if (part instanceof vscode.LanguageModelToolCallPart) {
-					toolCalls += 1;
-					this.send({
-						type: 'toolCall',
-						id,
-						call: {
-							id: part.callId,
-							name: part.name,
-							arguments: JSON.stringify(part.input ?? {})
-						}
-					});
-				} else {
-					// Reasoning models stream parts this bridge has no wire format for.
-					ignored.add((part as object)?.constructor?.name ?? 'unknown');
+				let toolCalls = 0;
+				let textLength = 0;
+				const ignored = new Set<string>();
+				for await (const part of response.stream) {
+					if (part instanceof vscode.LanguageModelTextPart) {
+						textLength += part.value.length;
+						this.send({ type: 'chunk', id, delta: part.value });
+					} else if (part instanceof vscode.LanguageModelToolCallPart) {
+						toolCalls += 1;
+						this.send({
+							type: 'toolCall',
+							id,
+							call: {
+								id: part.callId,
+								name: part.name,
+								arguments: JSON.stringify(part.input ?? {})
+							}
+						});
+					} else {
+						// Reasoning models stream parts this bridge has no wire format for.
+						ignored.add((part as object)?.constructor?.name ?? 'unknown');
+					}
 				}
-			}
 
-			// Sashiko parses the body as JSON, so an empty completion surfaces as an
-			// unrelated parse error several retries later. Report it as what it is.
-			if (textLength === 0 && toolCalls === 0) {
+				if (textLength > 0 || toolCalls > 0) {
+					if (ignored.size > 0) {
+						this.log.debug(`ignored response parts: ${[...ignored].join(', ')}`);
+					}
+					this.send({ type: 'done', id, finishReason: toolCalls > 0 ? 'tool_calls' : 'stop' });
+					return;
+				}
+
+				// Nothing was streamed, so nothing was forwarded either and the turn can be
+				// replayed safely. Sashiko parses the body as JSON, so giving up here at
+				// least surfaces the real cause instead of a parse error several retries on.
 				const detail = ignored.size > 0 ? ` (only ${[...ignored].join(', ')} parts)` : '';
-				const message = `The language model '${model.id}' returned an empty response${detail}.`;
-				this.log.warn(message);
-				this.send({ type: 'error', id, message });
-				return;
+				const message =
+					`The language model '${model.id}' returned an empty response${detail} ` +
+					`after ${Date.now() - started}ms.`;
+				if (attempt >= EMPTY_RESPONSE_ATTEMPTS || cancellation.token.isCancellationRequested) {
+					this.log.warn(message);
+					this.send({ type: 'error', id, message });
+					return;
+				}
+				this.log.warn(`${message} Retrying (${attempt}/${EMPTY_RESPONSE_ATTEMPTS - 1}).`);
+				await delay(attempt * EMPTY_RESPONSE_BACKOFF_MS, cancellation.token);
 			}
-			if (ignored.size > 0) {
-				this.log.debug(`ignored response parts: ${[...ignored].join(', ')}`);
-			}
-			this.send({ type: 'done', id, finishReason: toolCalls > 0 ? 'tool_calls' : 'stop' });
 		} catch (error) {
 			const message = describeError(error);
 			this.log.error(`language model request failed: ${message}`);
@@ -365,6 +385,19 @@ function toChatMessages(
 		result.push(vscode.LanguageModelChatMessage.User(JSON_ONLY_INSTRUCTION));
 	}
 	return result;
+}
+
+/** Sleeps between retries, waking early when the request is cancelled. */
+function delay(ms: number, token: vscode.CancellationToken): Promise<void> {
+	return new Promise<void>((resolve) => {
+		const done = (): void => {
+			clearTimeout(timer);
+			subscription.dispose();
+			resolve();
+		};
+		const timer = setTimeout(done, ms);
+		const subscription = token.onCancellationRequested(done);
+	});
 }
 
 /** Adds up the prompt's token count, which the chat API only reports per message. */
