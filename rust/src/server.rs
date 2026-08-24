@@ -15,7 +15,8 @@ use serde_json::{json, Value};
 use crate::bridge::{Host, StreamEvent};
 use crate::mcp;
 use crate::openai::{
-    chunk_body, completion_body, error_body, now_secs, CompletionRequest, ResponseToolCall,
+    chunk_body, completion_body, error_body, now_secs, unwrap_json_payload, CompletionRequest,
+    ResponseToolCall,
 };
 use crate::protocol::{estimate_tokens, Usage};
 
@@ -159,6 +160,7 @@ async fn chat_completions(
 
     let streaming = request.stream;
     let chat = request.into_chat_request();
+    let json_output = chat.json_output;
     let model = chat
         .model
         .clone()
@@ -176,6 +178,11 @@ async fn chat_completions(
                         completion_tokens: estimate_tokens(&text),
                     };
                 }
+                let text = if json_output {
+                    unwrap_json_payload(&text)
+                } else {
+                    text
+                };
                 Json(completion_body(
                     &id,
                     &model,

@@ -17,6 +17,14 @@ pub struct CompletionRequest {
     pub tools: Option<Vec<RequestTool>>,
     #[serde(default)]
     pub temperature: Option<f64>,
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResponseFormat {
+    #[serde(rename = "type", default)]
+    pub kind: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +95,10 @@ pub struct RequestFunction {
 
 impl CompletionRequest {
     pub fn into_chat_request(self) -> ChatRequest {
+        let json_output = self
+            .response_format
+            .as_ref()
+            .is_some_and(|format| format.kind.starts_with("json"));
         let messages = self
             .messages
             .into_iter()
@@ -131,7 +143,31 @@ impl CompletionRequest {
             messages,
             tools,
             temperature: self.temperature,
+            json_output,
         }
+    }
+}
+
+/// Recovers the JSON document from a response that a model wrapped in markdown fences
+/// or prose. Sashiko parses these bodies strictly, and the VS Code chat API cannot
+/// enforce `response_format`, so the unwrapping has to happen here.
+pub fn unwrap_json_payload(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return trimmed.to_string();
+    }
+
+    let fenced = match trimmed.strip_prefix("```") {
+        Some(rest) => {
+            let body = rest.split_once('\n').map_or(rest, |(_, body)| body);
+            body.rfind("```").map_or(body, |end| &body[..end])
+        }
+        None => trimmed,
+    };
+
+    match (fenced.find(['{', '[']), fenced.rfind(['}', ']'])) {
+        (Some(start), Some(end)) if end > start => fenced[start..=end].trim().to_string(),
+        _ => trimmed.to_string(),
     }
 }
 
@@ -223,4 +259,38 @@ pub fn chunk_body(id: &str, model: &str, delta: Value, finish_reason: Option<&st
 
 pub fn error_body(message: &str, kind: &str) -> Value {
     json!({ "error": { "message": message, "type": kind, "code": kind } })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unwrap_json_payload;
+
+    #[test]
+    fn leaves_bare_json_alone() {
+        assert_eq!(
+            unwrap_json_payload("  {\"concerns\": []}\n"),
+            "{\"concerns\": []}"
+        );
+    }
+
+    #[test]
+    fn strips_markdown_fences() {
+        assert_eq!(
+            unwrap_json_payload("```json\n{\"concerns\": []}\n```"),
+            "{\"concerns\": []}"
+        );
+    }
+
+    #[test]
+    fn strips_surrounding_prose() {
+        assert_eq!(
+            unwrap_json_payload("Here is the result:\n{\"concerns\": []}\nHope that helps."),
+            "{\"concerns\": []}"
+        );
+    }
+
+    #[test]
+    fn returns_input_when_there_is_no_json() {
+        assert_eq!(unwrap_json_payload(" I cannot help. "), "I cannot help.");
+    }
 }

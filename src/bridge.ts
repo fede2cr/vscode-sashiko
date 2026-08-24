@@ -8,6 +8,7 @@ interface ChatRequest {
 	messages: ChatMessage[];
 	tools?: ToolDef[];
 	temperature?: number;
+	jsonOutput?: boolean;
 }
 
 interface ChatMessage {
@@ -40,6 +41,9 @@ export interface BridgeEndpoint {
 
 /** Runs one MCP tool invocation on behalf of the bridge. */
 export type ToolHandler = (name: string, args: Record<string, unknown>) => Promise<string>;
+
+const JSON_ONLY_INSTRUCTION =
+	'Reply with a single valid JSON document and nothing else: no prose, no explanation, no markdown code fences.';
 
 /**
  * Owns the `sashiko-vscode-bridge serve` child process and answers its completion
@@ -198,15 +202,28 @@ export class LanguageModelBridge implements vscode.Disposable {
 				options.toolMode = vscode.LanguageModelChatToolMode.Auto;
 			}
 
-			const response = await model.sendRequest(
-				toChatMessages(request.messages),
-				options,
-				cancellation.token
-			);
+			const messages = toChatMessages(request.messages, request.jsonOutput);
+			// Sashiko builds its own prompts and does not always honour the budget in
+			// Settings.toml, so an oversized turn would otherwise fail without a reason.
+			const tokens = await countPromptTokens(model, messages, cancellation.token);
+			if (tokens > model.maxInputTokens) {
+				const message =
+					`The prompt is ${tokens.toLocaleString()} tokens but '${model.id}' accepts at most ` +
+					`${model.maxInputTokens.toLocaleString()}. Pick a model with a larger context window, ` +
+					'or lower sashiko.maxInputTokens so Sashiko sends less context.';
+				this.log.error(message);
+				this.send({ type: 'error', id, message });
+				return;
+			}
+
+			const response = await model.sendRequest(messages, options, cancellation.token);
 
 			let toolCalls = 0;
+			let textLength = 0;
+			const ignored = new Set<string>();
 			for await (const part of response.stream) {
 				if (part instanceof vscode.LanguageModelTextPart) {
+					textLength += part.value.length;
 					this.send({ type: 'chunk', id, delta: part.value });
 				} else if (part instanceof vscode.LanguageModelToolCallPart) {
 					toolCalls += 1;
@@ -219,11 +236,29 @@ export class LanguageModelBridge implements vscode.Disposable {
 							arguments: JSON.stringify(part.input ?? {})
 						}
 					});
+				} else {
+					// Reasoning models stream parts this bridge has no wire format for.
+					ignored.add((part as object)?.constructor?.name ?? 'unknown');
 				}
+			}
+
+			// Sashiko parses the body as JSON, so an empty completion surfaces as an
+			// unrelated parse error several retries later. Report it as what it is.
+			if (textLength === 0 && toolCalls === 0) {
+				const detail = ignored.size > 0 ? ` (only ${[...ignored].join(', ')} parts)` : '';
+				const message = `The language model '${model.id}' returned an empty response${detail}.`;
+				this.log.warn(message);
+				this.send({ type: 'error', id, message });
+				return;
+			}
+			if (ignored.size > 0) {
+				this.log.debug(`ignored response parts: ${[...ignored].join(', ')}`);
 			}
 			this.send({ type: 'done', id, finishReason: toolCalls > 0 ? 'tool_calls' : 'stop' });
 		} catch (error) {
-			this.send({ type: 'error', id, message: describeError(error) });
+			const message = describeError(error);
+			this.log.error(`language model request failed: ${message}`);
+			this.send({ type: 'error', id, message });
 		} finally {
 			this.inflight.delete(id);
 			cancellation.dispose();
@@ -276,7 +311,10 @@ export async function resolveModel(id?: string): Promise<vscode.LanguageModelCha
  * Maps OpenAI-shaped messages onto the VS Code chat API. The API has no system role,
  * so system prompts are folded into the leading user turn.
  */
-function toChatMessages(messages: ChatMessage[]): vscode.LanguageModelChatMessage[] {
+function toChatMessages(
+	messages: ChatMessage[],
+	jsonOutput?: boolean
+): vscode.LanguageModelChatMessage[] {
 	const result: vscode.LanguageModelChatMessage[] = [];
 
 	for (const message of messages) {
@@ -321,7 +359,24 @@ function toChatMessages(messages: ChatMessage[]): vscode.LanguageModelChatMessag
 	if (result.length === 0) {
 		result.push(vscode.LanguageModelChatMessage.User('Continue.'));
 	}
+	// The chat API has no equivalent of OpenAI's `response_format`, so the only way to
+	// hold the model to JSON is to say so in the prompt.
+	if (jsonOutput) {
+		result.push(vscode.LanguageModelChatMessage.User(JSON_ONLY_INSTRUCTION));
+	}
 	return result;
+}
+
+/** Adds up the prompt's token count, which the chat API only reports per message. */
+async function countPromptTokens(
+	model: vscode.LanguageModelChat,
+	messages: vscode.LanguageModelChatMessage[],
+	token: vscode.CancellationToken
+): Promise<number> {
+	const counts = await Promise.all(
+		messages.map((message) => model.countTokens(message, token))
+	);
+	return counts.reduce((total, count) => total + count, 0);
 }
 
 function parseArguments(raw: string): object {

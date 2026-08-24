@@ -100,6 +100,10 @@ pub struct ChatRequest {
     pub tools: Vec<ToolDef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// The caller asked for `response_format: json_object`; the VS Code chat API has no
+    /// JSON mode, so the extension host has to ask for it in the prompt instead.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub json_output: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
