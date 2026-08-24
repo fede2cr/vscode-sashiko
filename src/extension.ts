@@ -107,9 +107,11 @@ async function review(
 				title: `Sashiko: reviewing ${label(spec)}`,
 				cancellable: true
 			},
-			async (_progress, token) => {
+			async (progress, token) => {
 				token.onCancellationRequested(() => tools.cancel());
-				await tools.run(spec);
+				await tools.run(spec, {
+					onOutput: (line) => progress.report({ message: line.slice(0, 120) })
+				});
 			}
 		);
 

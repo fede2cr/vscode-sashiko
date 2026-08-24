@@ -150,6 +150,12 @@
           "minimum": 1,
           "description": "Number of concurrent reviews. Keep this low: every request consumes your VS Code chat model quota."
         },
+        "sashiko.requestIntervalMs": {
+          "type": "integer",
+          "default": 250,
+          "minimum": 0,
+          "description": "Smallest gap between language model requests. GitHub Copilot temporarily blocks extensions that send bursts of requests; raise this if reviews start failing with empty responses. Set to 0 to disable pacing."
+        },
         "sashiko.maxInputTokens": {
           "type": "integer",
           "default": 100000,

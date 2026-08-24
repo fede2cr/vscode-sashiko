@@ -7,6 +7,11 @@ import type { BridgeEndpoint } from './bridge';
 
 const execFileAsync = promisify(execFile);
 
+/** Cursor and colour sequences; the log channel prints them as literal noise. */
+const ANSI_ESCAPE = /\u001B\[[0-9;?]*[A-Za-z]/g;
+/** Progress frames Sashiko repaints in place, which belong in the progress UI. */
+const PROGRESS_FRAME = /^(Overall:|\[Patch \d+\])/;
+
 /** Flat finding produced by `sashiko-vscode-bridge parse-review`. */
 export interface Finding {
 	file?: string;
@@ -182,18 +187,18 @@ export class ReviewRunner implements vscode.Disposable {
 
 			let collected = '';
 			let errors = '';
+			let stdoutRest = '';
+			let stderrRest = '';
 			child.stdout.setEncoding('utf8');
 			child.stdout.on('data', (chunk: string) => {
 				collected += chunk;
-				this.log.append(chunk);
-				onOutput?.(chunk);
+				stdoutRest = this.forwardOutput(stdoutRest + chunk, onOutput);
 			});
 			child.stderr.setEncoding('utf8');
 			child.stderr.on('data', (chunk: string) => {
 				// Sashiko reports fatal failures here, not on the report stream.
 				errors += chunk;
-				this.log.append(chunk);
-				onOutput?.(chunk);
+				stderrRest = this.forwardOutput(stderrRest + chunk, onOutput);
 			});
 
 			child.on('error', (error) => {
@@ -206,9 +211,28 @@ export class ReviewRunner implements vscode.Disposable {
 			});
 			child.on('close', (code) => {
 				this.active = undefined;
+				this.forwardOutput(`${stdoutRest}\n${stderrRest}\n`, onOutput);
 				resolve({ output: collected, errors, code });
 			});
 		});
+	}
+
+	/** Logs whole lines, keeping Sashiko's redrawn progress frames out of the channel. */
+	private forwardOutput(buffered: string, onOutput?: (line: string) => void): string {
+		const lines = buffered.split('\n');
+		const rest = lines.pop() ?? '';
+		for (const raw of lines) {
+			const line = raw.replace(ANSI_ESCAPE, '').trim();
+			if (!line) {
+				continue;
+			}
+			if (PROGRESS_FRAME.test(line)) {
+				onOutput?.(line);
+			} else {
+				this.log.append(`${line}\n`);
+			}
+		}
+		return rest;
 	}
 
 	private async publishFindings(

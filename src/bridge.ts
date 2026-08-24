@@ -49,6 +49,8 @@ const JSON_ONLY_INSTRUCTION =
 const EMPTY_RESPONSE_ATTEMPTS = 3;
 /** Multiplied by the attempt number, so the provider gets a widening pause. */
 const EMPTY_RESPONSE_BACKOFF_MS = 2000;
+/** Below this, the turn was refused locally rather than answered with nothing. */
+const EMPTY_RESPONSE_MIN_RETRY_MS = 1000;
 
 /**
  * Owns the `sashiko-vscode-bridge serve` child process and answers its completion
@@ -60,6 +62,8 @@ export class LanguageModelBridge implements vscode.Disposable {
 	private endpoint?: BridgeEndpoint;
 	private ready?: Promise<BridgeEndpoint>;
 	private toolHandler?: ToolHandler;
+	private probed = false;
+	private nextRequestAt = 0;
 	private readonly inflight = new Map<string, vscode.CancellationTokenSource>();
 	private readonly endpointChanged = new vscode.EventEmitter<void>();
 
@@ -221,9 +225,14 @@ export class LanguageModelBridge implements vscode.Disposable {
 				return;
 			}
 
+			await this.waitForSlot(cancellation.token);
+
 			// A model that streams nothing is usually a transient provider hiccup. Sashiko
 			// retries with no backoff at all, so absorb it here rather than let a whole
 			// review collapse into a burst of failed turns.
+			const shape =
+				`${messages.length} messages, ${tokens.toLocaleString()}/` +
+				`${model.maxInputTokens.toLocaleString()} tokens, ${options.tools?.length ?? 0} tools`;
 			for (let attempt = 1; ; attempt++) {
 				const started = Date.now();
 				const response = await model.sendRequest(messages, options, cancellation.token);
@@ -263,16 +272,25 @@ export class LanguageModelBridge implements vscode.Disposable {
 				// Nothing was streamed, so nothing was forwarded either and the turn can be
 				// replayed safely. Sashiko parses the body as JSON, so giving up here at
 				// least surfaces the real cause instead of a parse error several retries on.
+				const elapsed = Date.now() - started;
 				const detail = ignored.size > 0 ? ` (only ${[...ignored].join(', ')} parts)` : '';
 				const message =
 					`The language model '${model.id}' returned an empty response${detail} ` +
-					`after ${Date.now() - started}ms.`;
-				if (attempt >= EMPTY_RESPONSE_ATTEMPTS || cancellation.token.isCancellationRequested) {
-					this.log.warn(message);
+					`after ${elapsed}ms.`;
+				// An instant empty stream is the provider refusing the turn without asking the
+				// model, so replaying it only spends quota against whatever refused it.
+				const worthRetrying = elapsed >= EMPTY_RESPONSE_MIN_RETRY_MS;
+				if (
+					!worthRetrying ||
+					attempt >= EMPTY_RESPONSE_ATTEMPTS ||
+					cancellation.token.isCancellationRequested
+				) {
+					this.log.warn(`${message} [${shape}]`);
+					await this.probeModel(model);
 					this.send({ type: 'error', id, message });
 					return;
 				}
-				this.log.warn(`${message} Retrying (${attempt}/${EMPTY_RESPONSE_ATTEMPTS - 1}).`);
+				this.log.warn(`${message} [${shape}] Retrying (${attempt}/${EMPTY_RESPONSE_ATTEMPTS - 1}).`);
 				await delay(attempt * EMPTY_RESPONSE_BACKOFF_MS, cancellation.token);
 			}
 		} catch (error) {
@@ -281,6 +299,52 @@ export class LanguageModelBridge implements vscode.Disposable {
 			this.send({ type: 'error', id, message });
 		} finally {
 			this.inflight.delete(id);
+			cancellation.dispose();
+		}
+	}
+
+	/** Spaces requests out: Copilot temporarily blocks extensions that burst. */
+	private async waitForSlot(token: vscode.CancellationToken): Promise<void> {
+		const interval = vscode.workspace
+			.getConfiguration('sashiko')
+			.get<number>('requestIntervalMs', 250);
+		if (interval <= 0) {
+			return;
+		}
+		const now = Date.now();
+		const slot = Math.max(now, this.nextRequestAt);
+		this.nextRequestAt = slot + interval;
+		if (slot > now) {
+			await delay(slot - now, token);
+		}
+	}
+
+	/** Runs one trivial turn, to tell a rejected prompt apart from a dead model path. */
+	private async probeModel(model: vscode.LanguageModelChat): Promise<void> {
+		if (this.probed) {
+			return;
+		}
+		this.probed = true;
+		const cancellation = new vscode.CancellationTokenSource();
+		const started = Date.now();
+		try {
+			const response = await model.sendRequest(
+				[vscode.LanguageModelChatMessage.User('Reply with OK.')],
+				{ justification: 'Sashiko is checking whether the language model still answers.' },
+				cancellation.token
+			);
+			let text = '';
+			for await (const part of response.stream) {
+				if (part instanceof vscode.LanguageModelTextPart) {
+					text += part.value;
+				}
+			}
+			this.log.warn(
+				`probe: '${model.id}' returned ${text.length} chars in ${Date.now() - started}ms`
+			);
+		} catch (error) {
+			this.log.warn(`probe: '${model.id}' failed after ${Date.now() - started}ms: ${describeError(error)}`);
+		} finally {
 			cancellation.dispose();
 		}
 	}
