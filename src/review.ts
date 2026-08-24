@@ -101,12 +101,22 @@ export class ReviewRunner implements vscode.Disposable {
 
 		this.log.info(`$ ${executable} ${args.join(' ')}`);
 
-		const stdout = await this.spawnReview(executable, args, context, onOutput);
-		return this.publishFindings(
-			stdout,
+		const { output, errors, code } = await this.spawnReview(executable, args, context, onOutput);
+		const findings = await this.publishFindings(
+			output,
 			context.diagnosticsRoot ?? context.repository,
 			context.diagnosticsRoot ? context.repository : undefined
 		);
+
+		// Sashiko exits 1 both for a review that reported high/critical findings and for
+		// one that never ran, so the report has to break the tie.
+		if (code !== 0 && findings.length === 0) {
+			throw new Error(
+				reportedError(errors) ??
+					`Sashiko exited with code ${code ?? 'unknown'}. See the Sashiko log.`
+			);
+		}
+		return findings;
 	}
 
 	/** Stages patch files or uncommitted work as commits in a throwaway worktree. */
@@ -149,8 +159,8 @@ export class ReviewRunner implements vscode.Disposable {
 		args: string[],
 		context: ReviewContext,
 		onOutput?: (line: string) => void
-	): Promise<string> {
-		return new Promise<string>((resolve, reject) => {
+	): Promise<{ output: string; errors: string; code: number | null }> {
+		return new Promise((resolve, reject) => {
 			const child = spawn(executable, args, {
 				cwd: context.repository,
 				env: {
@@ -171,6 +181,7 @@ export class ReviewRunner implements vscode.Disposable {
 			this.active = child;
 
 			let collected = '';
+			let errors = '';
 			child.stdout.setEncoding('utf8');
 			child.stdout.on('data', (chunk: string) => {
 				collected += chunk;
@@ -179,6 +190,8 @@ export class ReviewRunner implements vscode.Disposable {
 			});
 			child.stderr.setEncoding('utf8');
 			child.stderr.on('data', (chunk: string) => {
+				// Sashiko reports fatal failures here, not on the report stream.
+				errors += chunk;
 				this.log.append(chunk);
 				onOutput?.(chunk);
 			});
@@ -193,12 +206,7 @@ export class ReviewRunner implements vscode.Disposable {
 			});
 			child.on('close', (code) => {
 				this.active = undefined;
-				// Exit code 1 means findings were reported, which is a successful review.
-				if (code === 0 || code === 1) {
-					resolve(collected);
-				} else {
-					reject(new Error(`Sashiko exited with code ${code ?? 'unknown'}. See the Sashiko log.`));
-				}
+				resolve({ output: collected, errors, code });
 			});
 		});
 	}
@@ -282,6 +290,12 @@ export class ReviewRunner implements vscode.Disposable {
 		this.cancel();
 		this.diagnostics.dispose();
 	}
+}
+
+/** Picks the fatal error Sashiko printed, so the user sees it instead of an exit code. */
+function reportedError(errors: string): string | undefined {
+	const match = errors.match(/^Error:\s*(.+)$/m);
+	return match?.[1].trim();
 }
 
 function toSeverity(severity: string): vscode.DiagnosticSeverity {
