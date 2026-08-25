@@ -53,8 +53,8 @@ const BLOCKED_COOLDOWN_MS = 120_000;
 const BLOCKED_POLL_MS = 15_000;
 const BLOCKED_MESSAGE =
 	'GitHub Copilot has temporarily blocked this extension for sending too many requests. ' +
-	'Every review turn will fail until the block clears, so wait a few minutes before ' +
-	'retrying, and raise sashiko.requestIntervalMs to spread requests further apart.';
+	'This turn was held until the block was due to clear; if reviews keep failing here, ' +
+	'raise sashiko.requestIntervalMs to spread requests further apart.';
 
 /**
  * Owns the `sashiko-vscode-bridge serve` child process and answers its completion
@@ -267,6 +267,9 @@ export class LanguageModelBridge implements vscode.Disposable {
 			if (elapsed < REFUSAL_MAX_MS && (await this.isRefusingTurns(model))) {
 				this.blockedUntil = Date.now() + BLOCKED_COOLDOWN_MS;
 				this.log.error(BLOCKED_MESSAGE);
+				// Sit out the block before replying, so Sashiko's instant retry lands after
+				// it has cleared instead of spending an attempt on the same refusal.
+				await this.waitForSlot(cancellation.token);
 				this.send({ type: 'error', id, message: BLOCKED_MESSAGE });
 				return;
 			}

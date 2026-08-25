@@ -48,7 +48,8 @@ export class ReviewRunner implements vscode.Disposable {
 
 	constructor(
 		private readonly bridgePath: string,
-		private readonly log: vscode.LogOutputChannel
+		private readonly log: vscode.LogOutputChannel,
+		private readonly extensionVersion: string
 	) {}
 
 	get isRunning(): boolean {
@@ -104,6 +105,9 @@ export class ReviewRunner implements vscode.Disposable {
 					.replace('${repository}', context.repository)
 			);
 
+		this.log.info(
+			`vscode-sashiko ${this.extensionVersion}, ${await this.sashikoVersion(executable)}`
+		);
 		this.log.info(`$ ${executable} ${args.join(' ')}`);
 
 		const { output, errors, code } = await this.spawnReview(executable, args, context, onOutput);
@@ -156,6 +160,15 @@ export class ReviewRunner implements vscode.Disposable {
 		} catch (error) {
 			// A leaked scratch worktree is untidy, not fatal.
 			this.log.warn(`could not remove ${worktree}: ${String(error)}`);
+		}
+	}
+
+	private async sashikoVersion(executable: string): Promise<string> {
+		try {
+			const { stdout } = await execFileAsync(executable, ['--version']);
+			return stdout.trim() || `${executable} (version unknown)`;
+		} catch (error) {
+			return `${executable} (version unavailable: ${String(error)})`;
 		}
 	}
 

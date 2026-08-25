@@ -13,7 +13,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const log = vscode.window.createOutputChannel('Sashiko', { log: true });
 	const bridgePath = resolveBridgePath(context);
 	const bridge = new LanguageModelBridge(bridgePath, log);
-	const runner = new ReviewRunner(bridgePath, log);
+	const runner = new ReviewRunner(bridgePath, log, context.extension.packageJSON.version);
 	const models = new ModelSelection(context.globalState, log);
 	const tools = new ReviewTools(context.globalStorageUri.fsPath, bridge, runner, models, log);
 
