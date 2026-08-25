@@ -45,14 +45,12 @@ export type ToolHandler = (name: string, args: Record<string, unknown>) => Promi
 const JSON_ONLY_INSTRUCTION =
 	'Reply with a single valid JSON document and nothing else: no prose, no explanation, no markdown code fences.';
 
-/** How many times a turn that streamed nothing is replayed before it is reported. */
-const EMPTY_RESPONSE_ATTEMPTS = 3;
-/** Multiplied by the attempt number, so the provider gets a widening pause. */
-const EMPTY_RESPONSE_BACKOFF_MS = 2000;
-/** Below this, the turn was refused locally rather than answered with nothing. */
-const EMPTY_RESPONSE_MIN_RETRY_MS = 1000;
+/** Answering this fast means something refused the turn without asking the model. */
+const REFUSAL_MAX_MS = 1000;
 /** How long to stop calling the model once Copilot starts refusing this extension. */
 const BLOCKED_COOLDOWN_MS = 120_000;
+/** Sashiko's HTTP client gives up at 300s, so held turns have to wake well before that. */
+const BLOCKED_POLL_MS = 15_000;
 const BLOCKED_MESSAGE =
 	'GitHub Copilot has temporarily blocked this extension for sending too many requests. ' +
 	'Every review turn will fail until the block clears, so wait a few minutes before ' +
@@ -204,10 +202,7 @@ export class LanguageModelBridge implements vscode.Disposable {
 		const cancellation = new vscode.CancellationTokenSource();
 		this.inflight.set(id, cancellation);
 		try {
-			if (Date.now() < this.blockedUntil) {
-				this.send({ type: 'error', id, message: BLOCKED_MESSAGE });
-				return;
-			}
+			await this.waitForSlot(cancellation.token);
 			const model = await resolveModel(request.model);
 			const options: vscode.LanguageModelChatRequestOptions = {
 				justification: 'Sashiko is reviewing Linux kernel patches on your behalf.'
@@ -222,92 +217,60 @@ export class LanguageModelBridge implements vscode.Disposable {
 			}
 
 			const messages = toChatMessages(request.messages, request.jsonOutput);
-			// Sashiko builds its own prompts and does not always honour the budget in
-			// Settings.toml, so an oversized turn would otherwise fail without a reason.
-			const tokens = await countPromptTokens(model, messages, cancellation.token);
-			if (tokens > model.maxInputTokens) {
-				const message =
-					`The prompt is ${tokens.toLocaleString()} tokens but '${model.id}' accepts at most ` +
-					`${model.maxInputTokens.toLocaleString()}. Pick a model with a larger context window, ` +
-					'or lower sashiko.maxInputTokens so Sashiko sends less context.';
-				this.log.error(message);
-				this.send({ type: 'error', id, message });
+			const started = Date.now();
+			const response = await model.sendRequest(messages, options, cancellation.token);
+
+			let toolCalls = 0;
+			let textLength = 0;
+			const ignored = new Set<string>();
+			for await (const part of response.stream) {
+				if (part instanceof vscode.LanguageModelTextPart) {
+					textLength += part.value.length;
+					this.send({ type: 'chunk', id, delta: part.value });
+				} else if (part instanceof vscode.LanguageModelToolCallPart) {
+					toolCalls += 1;
+					this.send({
+						type: 'toolCall',
+						id,
+						call: {
+							id: part.callId,
+							name: part.name,
+							arguments: JSON.stringify(part.input ?? {})
+						}
+					});
+				} else {
+					// Reasoning models stream parts this bridge has no wire format for.
+					ignored.add((part as object)?.constructor?.name ?? 'unknown');
+				}
+			}
+
+			if (textLength > 0 || toolCalls > 0) {
+				if (ignored.size > 0) {
+					this.log.debug(`ignored response parts: ${[...ignored].join(', ')}`);
+				}
+				this.send({ type: 'done', id, finishReason: toolCalls > 0 ? 'tool_calls' : 'stop' });
 				return;
 			}
 
-			await this.waitForSlot(cancellation.token);
-
-			// A model that streams nothing is usually a transient provider hiccup. Sashiko
-			// retries with no backoff at all, so absorb it here rather than let a whole
-			// review collapse into a burst of failed turns.
-			const shape =
-				`${messages.length} messages, ${tokens.toLocaleString()}/` +
-				`${model.maxInputTokens.toLocaleString()} tokens, ${options.tools?.length ?? 0} tools`;
-			for (let attempt = 1; ; attempt++) {
-				const started = Date.now();
-				const response = await model.sendRequest(messages, options, cancellation.token);
-
-				let toolCalls = 0;
-				let textLength = 0;
-				const ignored = new Set<string>();
-				for await (const part of response.stream) {
-					if (part instanceof vscode.LanguageModelTextPart) {
-						textLength += part.value.length;
-						this.send({ type: 'chunk', id, delta: part.value });
-					} else if (part instanceof vscode.LanguageModelToolCallPart) {
-						toolCalls += 1;
-						this.send({
-							type: 'toolCall',
-							id,
-							call: {
-								id: part.callId,
-								name: part.name,
-								arguments: JSON.stringify(part.input ?? {})
-							}
-						});
-					} else {
-						// Reasoning models stream parts this bridge has no wire format for.
-						ignored.add((part as object)?.constructor?.name ?? 'unknown');
-					}
-				}
-
-				if (textLength > 0 || toolCalls > 0) {
-					if (ignored.size > 0) {
-						this.log.debug(`ignored response parts: ${[...ignored].join(', ')}`);
-					}
-					this.send({ type: 'done', id, finishReason: toolCalls > 0 ? 'tool_calls' : 'stop' });
-					return;
-				}
-
-				// Nothing was streamed, so nothing was forwarded either and the turn can be
-				// replayed safely. Sashiko parses the body as JSON, so giving up here at
-				// least surfaces the real cause instead of a parse error several retries on.
-				const elapsed = Date.now() - started;
-				const detail = ignored.size > 0 ? ` (only ${[...ignored].join(', ')} parts)` : '';
-				const message =
-					`The language model '${model.id}' returned an empty response${detail} ` +
-					`after ${elapsed}ms.`;
-				// An instant empty stream is the provider refusing the turn without asking the
-				// model, so replaying it only spends quota against whatever refused it.
-				const worthRetrying = elapsed >= EMPTY_RESPONSE_MIN_RETRY_MS;
-				if (!worthRetrying && (await this.isRefusingTurns(model))) {
-					this.blockedUntil = Date.now() + BLOCKED_COOLDOWN_MS;
-					this.log.error(BLOCKED_MESSAGE);
-					this.send({ type: 'error', id, message: BLOCKED_MESSAGE });
-					return;
-				}
-				if (
-					!worthRetrying ||
-					attempt >= EMPTY_RESPONSE_ATTEMPTS ||
-					cancellation.token.isCancellationRequested
-				) {
-					this.log.warn(`${message} [${shape}]`);
-					this.send({ type: 'error', id, message });
-					return;
-				}
-				this.log.warn(`${message} [${shape}] Retrying (${attempt}/${EMPTY_RESPONSE_ATTEMPTS - 1}).`);
-				await delay(attempt * EMPTY_RESPONSE_BACKOFF_MS, cancellation.token);
+			// Sashiko parses the body as JSON, so an empty completion surfaces as an
+			// unrelated parse error several turns later. Report it as what it is.
+			const elapsed = Date.now() - started;
+			const detail = ignored.size > 0 ? ` (only ${[...ignored].join(', ')} parts)` : '';
+			const message =
+				`The language model '${model.id}' returned an empty response${detail} ` +
+				`after ${elapsed}ms.`;
+			this.log.warn(
+				`${message} [${messages.length} messages, ${options.tools?.length ?? 0} tools]`
+			);
+			// Answering instantly is what a refusal looks like; the model itself always
+			// takes seconds. Confirm with a trivial turn before parking the whole review.
+			if (elapsed < REFUSAL_MAX_MS && (await this.isRefusingTurns(model))) {
+				this.blockedUntil = Date.now() + BLOCKED_COOLDOWN_MS;
+				this.log.error(BLOCKED_MESSAGE);
+				this.send({ type: 'error', id, message: BLOCKED_MESSAGE });
+				return;
 			}
+			this.send({ type: 'error', id, message });
 		} catch (error) {
 			const message = describeError(error);
 			this.log.error(`language model request failed: ${message}`);
@@ -318,11 +281,24 @@ export class LanguageModelBridge implements vscode.Disposable {
 		}
 	}
 
-	/** Spaces requests out: Copilot temporarily blocks extensions that burst. */
+	/**
+	 * Holds a turn until it is this bridge's turn to call the model. Sashiko retries with
+	 * `retry after 0ns`, so pacing has to happen here or not at all.
+	 */
 	private async waitForSlot(token: vscode.CancellationToken): Promise<void> {
+		// Sitting on the request is what makes Sashiko wait; answering, even with an
+		// error, just brings the next one straight back.
+		if (Date.now() < this.blockedUntil) {
+			this.log.info(
+				`holding turn for ${Math.round((this.blockedUntil - Date.now()) / 1000)}s until the block clears`
+			);
+		}
+		while (Date.now() < this.blockedUntil && !token.isCancellationRequested) {
+			await delay(Math.min(this.blockedUntil - Date.now(), BLOCKED_POLL_MS), token);
+		}
 		const interval = vscode.workspace
 			.getConfiguration('sashiko')
-			.get<number>('requestIntervalMs', 250);
+			.get<number>('requestIntervalMs', 1000);
 		if (interval <= 0) {
 			return;
 		}
@@ -477,18 +453,6 @@ function delay(ms: number, token: vscode.CancellationToken): Promise<void> {
 		const timer = setTimeout(done, ms);
 		const subscription = token.onCancellationRequested(done);
 	});
-}
-
-/** Adds up the prompt's token count, which the chat API only reports per message. */
-async function countPromptTokens(
-	model: vscode.LanguageModelChat,
-	messages: vscode.LanguageModelChatMessage[],
-	token: vscode.CancellationToken
-): Promise<number> {
-	const counts = await Promise.all(
-		messages.map((message) => model.countTokens(message, token))
-	);
-	return counts.reduce((total, count) => total + count, 0);
 }
 
 function parseArguments(raw: string): object {
