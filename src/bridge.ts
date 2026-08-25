@@ -51,6 +51,12 @@ const EMPTY_RESPONSE_ATTEMPTS = 3;
 const EMPTY_RESPONSE_BACKOFF_MS = 2000;
 /** Below this, the turn was refused locally rather than answered with nothing. */
 const EMPTY_RESPONSE_MIN_RETRY_MS = 1000;
+/** How long to stop calling the model once Copilot starts refusing this extension. */
+const BLOCKED_COOLDOWN_MS = 120_000;
+const BLOCKED_MESSAGE =
+	'GitHub Copilot has temporarily blocked this extension for sending too many requests. ' +
+	'Every review turn will fail until the block clears, so wait a few minutes before ' +
+	'retrying, and raise sashiko.requestIntervalMs to spread requests further apart.';
 
 /**
  * Owns the `sashiko-vscode-bridge serve` child process and answers its completion
@@ -62,7 +68,7 @@ export class LanguageModelBridge implements vscode.Disposable {
 	private endpoint?: BridgeEndpoint;
 	private ready?: Promise<BridgeEndpoint>;
 	private toolHandler?: ToolHandler;
-	private probed = false;
+	private blockedUntil = 0;
 	private nextRequestAt = 0;
 	private readonly inflight = new Map<string, vscode.CancellationTokenSource>();
 	private readonly endpointChanged = new vscode.EventEmitter<void>();
@@ -198,6 +204,10 @@ export class LanguageModelBridge implements vscode.Disposable {
 		const cancellation = new vscode.CancellationTokenSource();
 		this.inflight.set(id, cancellation);
 		try {
+			if (Date.now() < this.blockedUntil) {
+				this.send({ type: 'error', id, message: BLOCKED_MESSAGE });
+				return;
+			}
 			const model = await resolveModel(request.model);
 			const options: vscode.LanguageModelChatRequestOptions = {
 				justification: 'Sashiko is reviewing Linux kernel patches on your behalf.'
@@ -280,13 +290,18 @@ export class LanguageModelBridge implements vscode.Disposable {
 				// An instant empty stream is the provider refusing the turn without asking the
 				// model, so replaying it only spends quota against whatever refused it.
 				const worthRetrying = elapsed >= EMPTY_RESPONSE_MIN_RETRY_MS;
+				if (!worthRetrying && (await this.isRefusingTurns(model))) {
+					this.blockedUntil = Date.now() + BLOCKED_COOLDOWN_MS;
+					this.log.error(BLOCKED_MESSAGE);
+					this.send({ type: 'error', id, message: BLOCKED_MESSAGE });
+					return;
+				}
 				if (
 					!worthRetrying ||
 					attempt >= EMPTY_RESPONSE_ATTEMPTS ||
 					cancellation.token.isCancellationRequested
 				) {
 					this.log.warn(`${message} [${shape}]`);
-					await this.probeModel(model);
 					this.send({ type: 'error', id, message });
 					return;
 				}
@@ -319,12 +334,12 @@ export class LanguageModelBridge implements vscode.Disposable {
 		}
 	}
 
-	/** Runs one trivial turn, to tell a rejected prompt apart from a dead model path. */
-	private async probeModel(model: vscode.LanguageModelChat): Promise<void> {
-		if (this.probed) {
-			return;
-		}
-		this.probed = true;
+	/**
+	 * Sends one trivial turn to tell a rejected prompt apart from a refused extension.
+	 * Copilot blocks an extension that sends too many requests and VS Code surfaces that
+	 * as an empty stream rather than an error, so a tiny prompt failing too is the tell.
+	 */
+	private async isRefusingTurns(model: vscode.LanguageModelChat): Promise<boolean> {
 		const cancellation = new vscode.CancellationTokenSource();
 		const started = Date.now();
 		try {
@@ -339,11 +354,11 @@ export class LanguageModelBridge implements vscode.Disposable {
 					text += part.value;
 				}
 			}
-			this.log.warn(
-				`probe: '${model.id}' returned ${text.length} chars in ${Date.now() - started}ms`
-			);
+			this.log.warn(`probe: '${model.id}' returned ${text.length} chars in ${Date.now() - started}ms`);
+			return text.length === 0;
 		} catch (error) {
 			this.log.warn(`probe: '${model.id}' failed after ${Date.now() - started}ms: ${describeError(error)}`);
+			return false;
 		} finally {
 			cancellation.dispose();
 		}
