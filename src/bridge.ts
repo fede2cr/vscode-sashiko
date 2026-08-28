@@ -47,6 +47,8 @@ const JSON_ONLY_INSTRUCTION =
 
 /** Answering this fast means something refused the turn without asking the model. */
 const REFUSAL_MAX_MS = 1000;
+/** Mirrors the `sashiko.requestIntervalMs` default: slow enough that Copilot stops blocking us. */
+const DEFAULT_REQUEST_INTERVAL_MS = 30_000;
 /** How long to stop calling the model once Copilot starts refusing this extension. */
 const BLOCKED_COOLDOWN_MS = 120_000;
 /** Sashiko's HTTP client gives up at 300s, so held turns have to wake well before that. */
@@ -301,7 +303,7 @@ export class LanguageModelBridge implements vscode.Disposable {
 		}
 		const interval = vscode.workspace
 			.getConfiguration('sashiko')
-			.get<number>('requestIntervalMs', 1000);
+			.get<number>('requestIntervalMs', DEFAULT_REQUEST_INTERVAL_MS);
 		if (interval <= 0) {
 			return;
 		}

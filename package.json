@@ -152,9 +152,9 @@
         },
         "sashiko.requestIntervalMs": {
           "type": "integer",
-          "default": 1000,
+          "default": 30000,
           "minimum": 0,
-          "description": "Smallest gap between language model requests. Sashiko fans out stages in parallel and retries without any backoff, so the extension paces the requests instead. GitHub Copilot temporarily blocks extensions that send bursts; raise this if reviews fail with empty responses. Set to 0 to disable pacing."
+          "description": "Smallest gap between language model requests. Sashiko fans out stages in parallel and retries without any backoff, so the extension paces the requests instead. GitHub Copilot temporarily blocks extensions that send bursts, so the default is deliberately slow; lower it only if you would rather risk a block than wait. Set to 0 to disable pacing."
         },
         "sashiko.maxInputTokens": {
           "type": "integer",
